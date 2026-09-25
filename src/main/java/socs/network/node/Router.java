@@ -133,6 +133,10 @@ public class Router {
           ports[freePort] = link;
         }
         System.out.println("Your attach request has been accepted;");
+
+        Thread listener = new Thread(() -> listenOnLink(link));
+        listener.setDaemon(true);
+        listener.start();
       } else {
         // Rejected
         System.out.println("Your attach request has been rejected;");
@@ -194,7 +198,6 @@ public class Router {
       }
     } catch (Exception e) {
       System.err.println("Error handling incoming connection: " + e.getMessage());
-    } finally {
       try { clientSocket.close(); } catch (Exception ignored) {}
     }
   }
@@ -263,6 +266,10 @@ public class Router {
           // Send HELLO back to confirm acceptance
           out.writeObject(makeHelloPacket(senderSimIP, packet.weight));
           out.flush();
+          final Link link = newLink;
+          Thread listener = new Thread(() -> listenOnLink(link));
+          listener.setDaemon(true);
+          listener.start();
         }
       } else {
         System.out.println("You rejected the attach request;");
@@ -273,11 +280,62 @@ public class Router {
     }
   }
 
+  private void listenOnLink(Link link){
+      try{
+        while (true) {
+          SOSPFPacket packet = (SOSPFPacket) link.ois.readObject();
+          if (packet.sospfType == 0){
+            handleHelloOnLink(link, packet);
+          }
+        }
+      } catch (Exception e){
+        System.out.println("Exception occurred when trying to listen on link: " + e);
+      }
+  }
+
+  private synchronized void handleHelloOnLink(Link link, SOSPFPacket packet){
+    RouterDescription neighbor = link.router2;
+    System.out.println("received HELLO from " + packet.srcIP + ";");
+
+    if (neighbor.status == null){
+      if (link.startedByUs){
+        neighbor.status = RouterStatus.TWO_WAY;
+        System.out.println("set" + packet.srcIP + " STATE to TWO_WAY;");
+        sendHello(link);
+      } else {
+        neighbor.status = RouterStatus.INIT;
+        System.out.println("set " + packet.srcIP + " STATE to INIT;");
+        sendHello(link);
+      }
+    } else if (neighbor.status == RouterStatus.INIT) {
+      neighbor.status = RouterStatus.TWO_WAY;
+      System.out.println("set " + packet.srcIP + " STATE to TWO_WAY;");
+    }
+  }
+
+  private void sendHello(Link link){
+    try {
+      synchronized (link) {
+        link.oos.writeObject(makeHelloPacket(link.router2.simulatedIPAddress, link.weight));
+        link.oos.flush();
+      }
+    } catch (Exception e){
+      System.err.println("Failed to send HELLO to " + link.router2.simulatedIPAddress);
+    }
+  }
+
   /**
    * broadcast Hello to neighbors
    */
   private void processStart() {
-
+    synchronized (ports) {
+      for (Link link : ports) {
+        if (link != null){
+          link.startedByUs = true;
+          sendHello(link);
+        }
+      }
+    }
   }
 
   /**
@@ -322,7 +380,7 @@ public class Router {
 
   /**
    * update the weight of a specific port.
-   * This change should trigger synchronization of the Link State Database by sending 
+   * This change should trigger synchronization of the Link State Database by sending
    * a Link State Advertisement (LSA) update to all neighboring routers in the topology.
    *
    * @param portNumber the port number (0-3) to update
@@ -339,7 +397,7 @@ public class Router {
    * When you run send, the window of the router where you run the command should print:
    * "Sending message to <Destination IP>"
    * <p/>
-   * For each intermediate router on the shortest path (excluding the source and destination), 
+   * For each intermediate router on the shortest path (excluding the source and destination),
    * the router window should print:
    * "Forwarding packet from <Source IP> to <Destination IP>"
    * <p/>
