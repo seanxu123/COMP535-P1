@@ -300,7 +300,7 @@ public class Router {
     if (neighbor.status == null){
       if (link.startedByUs){
         neighbor.status = RouterStatus.TWO_WAY;
-        System.out.println("set" + packet.srcIP + " STATE to TWO_WAY;");
+        System.out.println("set " + packet.srcIP + " STATE to TWO_WAY;");
         sendHello(link);
       } else {
         neighbor.status = RouterStatus.INIT;
