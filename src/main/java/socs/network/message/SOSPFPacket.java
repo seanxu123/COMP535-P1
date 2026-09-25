@@ -8,7 +8,7 @@ public class SOSPFPacket implements Serializable {
 
   //for inter-process communication
   public String srcProcessIP;
-  public short srcProcessPort;
+  public int srcProcessPort;
 
   //simulated IP address
   public String srcIP;

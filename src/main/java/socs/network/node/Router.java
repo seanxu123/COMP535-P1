@@ -1,9 +1,15 @@
 package socs.network.node;
 
+import socs.network.message.SOSPFPacket;
 import socs.network.util.Configuration;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 
 
 public class Router {
@@ -12,12 +18,42 @@ public class Router {
 
   RouterDescription rd = new RouterDescription();
 
-  //assuming that all routers are with 4 ports
+  // assuming that all routers are with 4 ports
   Link[] ports = new Link[4];
+
+  private ServerSocket serverSocket;
+  private final BufferedReader consoleReader = new BufferedReader(new InputStreamReader(System.in));
+
+  // used for attach request Y/N prompting between threads
+  private boolean hasPendingAttachRequest = false;
+  private Boolean attachRequestAnswer = null;
+  private final Object attachLock = new Object();
 
   public Router(Configuration config) {
     rd.simulatedIPAddress = config.getString("socs.network.router.ip");
     lsd = new LinkStateDatabase(rd);
+
+    // set up server socket on any available port
+    try {
+      serverSocket = new ServerSocket(0);
+      rd.processIPAddress = InetAddress.getLocalHost().getHostAddress();
+      rd.processPortNumber = serverSocket.getLocalPort();
+    } catch (Exception e) {
+      System.err.println("Failed to create server socket: " + e.getMessage());
+      System.exit(1);
+    }
+
+    // print router info so user can run attach from other terminals
+    System.out.println("========================================");
+    System.out.println("Process IP  : " + rd.processIPAddress);
+    System.out.println("Process Port: " + rd.processPortNumber);
+    System.out.println("Simulated IP: " + rd.simulatedIPAddress);
+    System.out.println("========================================");
+
+    // start listening for incoming connections in background
+    Thread listenerThread = new Thread(() -> requestHandler());
+    listenerThread.setDaemon(true);
+    listenerThread.start();
   }
 
   /**
@@ -48,19 +84,192 @@ public class Router {
    * <p/>
    * NOTE: this command should not trigger link database synchronization
    */
-  private void processAttach(String processIP, short processPort,
+  private void processAttach(String processIP, int processPort,
                              String simulatedIP, short weight) {
+    // Check for duplicate attachment and find a free port atomically
+    int freePort = -1;
+    synchronized (ports) {
+      for (Link link : ports) {
+        if (link != null && link.router2.simulatedIPAddress.equals(simulatedIP)) {
+          System.out.println("Already attached to " + simulatedIP);
+          return;
+        }
+      }
+      for (int i = 0; i < ports.length; i++) {
+        if (ports[i] == null) {
+          freePort = i;
+          break;
+        }
+      }
+    }
+    if (freePort == -1) {
+      System.out.println("All ports are occupied, cannot attach.");
+      return;
+    }
 
+    try {
+      // Open TCP connection to the remote router's server socket
+      Socket socket = new Socket(processIP, processPort);
+      ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+      ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+
+      // Build and send HELLO packet to request attachment
+      SOSPFPacket hello = makeHelloPacket(simulatedIP);
+      out.writeObject(hello);
+      out.flush();
+
+      // Wait for accept/reject response
+      SOSPFPacket response = (SOSPFPacket) in.readObject();
+
+      if (response.sospfType == 0) {
+        // Accepted — create the link and store it
+        RouterDescription remoteRd = new RouterDescription();
+        remoteRd.processIPAddress = processIP;
+        remoteRd.processPortNumber = processPort;
+        remoteRd.simulatedIPAddress = simulatedIP;
+        synchronized (ports) {
+          ports[freePort] = new Link(rd, remoteRd);
+        }
+      } else {
+        // Rejected
+        System.out.println("Your attach request has been rejected;");
+      }
+
+      out.close();
+      in.close();
+      socket.close();
+    } catch (Exception e) {
+      System.err.println("Failed to attach to " + simulatedIP + ": " + e.getMessage());
+    }
   }
 
+  private SOSPFPacket makeHelloPacket(String dstIP) {
+    SOSPFPacket pkt = new SOSPFPacket();
+    pkt.srcProcessIP = rd.processIPAddress;
+    pkt.srcProcessPort = rd.processPortNumber;
+    pkt.srcIP = rd.simulatedIPAddress;
+    pkt.dstIP = dstIP;
+    pkt.sospfType = 0;
+    pkt.routerID = rd.simulatedIPAddress;
+    pkt.neighborID = rd.simulatedIPAddress;
+    return pkt;
+  }
+
+  private SOSPFPacket makeRejectPacket() {
+    SOSPFPacket pkt = new SOSPFPacket();
+    pkt.sospfType = -1;
+    return pkt;
+  }
 
   /**
-   * process request from the remote router. 
-   * For example: when router2 tries to attach router1. Router1 can decide whether it will accept this request. 
+   * process request from the remote router.
+   * For example: when router2 tries to attach router1. Router1 can decide whether it will accept this request.
    * The intuition is that if router2 is an unknown/anomaly router, it is always safe to reject the attached request from router2.
+   *
+   * Runs in a background daemon thread. Loops forever accepting incoming TCP connections
+   * and spawns a new thread to handle each one.
    */
   private void requestHandler() {
+    while (true) {
+      try {
+        Socket clientSocket = serverSocket.accept();
+        Thread handler = new Thread(() -> handleIncomingConnection(clientSocket));
+        handler.setDaemon(true);
+        handler.start();
+      } catch (Exception e) {
+        System.err.println("Error accepting connection: " + e.getMessage());
+      }
+    }
+  }
 
+  private void handleIncomingConnection(Socket clientSocket) {
+    try {
+      ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream());
+      ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream());
+
+      SOSPFPacket packet = (SOSPFPacket) in.readObject();
+
+      if (packet.sospfType == 0) {
+        handleHello(packet, in, out);
+      }
+
+      out.close();
+      in.close();
+    } catch (Exception e) {
+      System.err.println("Error handling incoming connection: " + e.getMessage());
+    } finally {
+      try { clientSocket.close(); } catch (Exception ignored) {}
+    }
+  }
+
+  private void handleHello(SOSPFPacket packet, ObjectInputStream in, ObjectOutputStream out) throws Exception {
+    String senderSimIP = packet.neighborID;
+
+    // Check if link already exists
+    boolean alreadyAttached = false;
+    synchronized (ports) {
+      for (Link link : ports) {
+        if (link != null && link.router2.simulatedIPAddress.equals(senderSimIP)) {
+          alreadyAttached = true;
+          break;
+        }
+      }
+    }
+
+    if (alreadyAttached) {
+      // Already attached: HELLO belongs to start handshake
+      System.out.println("received HELLO from " + senderSimIP + ";");
+      return;
+    }
+
+    // New attach request — prompt user for Y/N
+    System.out.println("received HELLO from " + senderSimIP + ";");
+    System.out.println("Do you accept this request? (Y/N)");
+
+    // Set the pending flag and wait for the terminal thread to read the answer
+    synchronized (attachLock) {
+      hasPendingAttachRequest = true;
+      attachRequestAnswer = null;
+      while (attachRequestAnswer == null) {
+        attachLock.wait();
+      }
+      boolean accepted = attachRequestAnswer;
+      hasPendingAttachRequest = false;
+
+      if (accepted) {
+        // Find a free port and store the link atomically
+        int freePort = -1;
+        synchronized (ports) {
+          for (int i = 0; i < ports.length; i++) {
+            if (ports[i] == null) {
+              freePort = i;
+              break;
+            }
+          }
+          if (freePort != -1) {
+            RouterDescription remoteRd = new RouterDescription();
+            remoteRd.processIPAddress = packet.srcProcessIP;
+            remoteRd.processPortNumber = packet.srcProcessPort;
+            remoteRd.simulatedIPAddress = senderSimIP;
+            ports[freePort] = new Link(rd, remoteRd);
+          }
+        }
+        if (freePort == -1) {
+          // All ports occupied even though user said Y
+          System.out.println("All ports are occupied, rejecting.");
+          out.writeObject(makeRejectPacket());
+          out.flush();
+        } else {
+          // Send HELLO back to confirm acceptance
+          out.writeObject(makeHelloPacket(senderSimIP));
+          out.flush();
+        }
+      } else {
+        System.out.println("You rejected the attach request;");
+        out.writeObject(makeRejectPacket());
+        out.flush();
+      }
+    }
   }
 
   /**
@@ -77,7 +286,7 @@ public class Router {
    * <p/>
    * This command does trigger the link database synchronization
    */
-  private void processConnect(String processIP, short processPort,
+  private void processConnect(String processIP, int processPort,
                               String simulatedIP, short weight) {
 
   }
@@ -86,7 +295,13 @@ public class Router {
    * output the neighbors of the routers
    */
   private void processNeighbors() {
-
+    synchronized (ports) {
+      for (Link link : ports) {
+        if (link != null && link.router2.status == RouterStatus.TWO_WAY) {
+          System.out.println(link.router2.simulatedIPAddress);
+        }
+      }
+    }
   }
 
   /**
@@ -99,7 +314,7 @@ public class Router {
   /**
    * update the weight of an attached link
    */
-  private void updateWeight(String processIP, short processPort,
+  private void updateWeight(String processIP, int processPort,
                              String simulatedIP, short weight){
 
   }
@@ -153,63 +368,77 @@ public class Router {
    *
    * @param packet the received application message packet
    */
-  private void handleApplicationMessage(socs.network.message.SOSPFPacket packet) {
+  private void handleApplicationMessage(SOSPFPacket packet) {
 
   }
 
   public void terminal() {
     try {
-      InputStreamReader isReader = new InputStreamReader(System.in);
-      BufferedReader br = new BufferedReader(isReader);
       System.out.print(">> ");
-      String command = br.readLine();
+      String command;
       while (true) {
-        if (command.startsWith("detect ")) {
-          String[] cmdLine = command.split(" ");
-          processDetect(cmdLine[1]);
-        } else if (command.startsWith("disconnect ")) {
-          String[] cmdLine = command.split(" ");
-          processDisconnect(Short.parseShort(cmdLine[1]));
-        } else if (command.startsWith("quit")) {
-          processQuit();
-        } else if (command.startsWith("attach ")) {
-          String[] cmdLine = command.split(" ");
-          processAttach(cmdLine[1], Short.parseShort(cmdLine[2]),
-                  cmdLine[3], Short.parseShort(cmdLine[4]));
-        } else if (command.equals("start")) {
-          processStart();
-        } else if (command.equals("connect ")) {
-          String[] cmdLine = command.split(" ");
-          processConnect(cmdLine[1], Short.parseShort(cmdLine[2]),
-                  cmdLine[3], Short.parseShort(cmdLine[4]));
-        } else if (command.equals("neighbors")) {
-          //output neighbors
-          processNeighbors();
-        } else if (command.startsWith("send ")) {
-          //send [Destination IP] [Message]
-          String[] cmdLine = command.split(" ", 3);
-          if (cmdLine.length >= 3) {
-            processSend(cmdLine[1], cmdLine[2]);
-          } else {
-            System.out.println("Usage: send [Destination IP] [Message]");
+        command = consoleReader.readLine();
+        if (command == null) break;
+        command = command.trim();
+
+        // Handle interactive attach confirmation if one is pending
+        synchronized (attachLock) {
+          if (hasPendingAttachRequest) {
+            attachRequestAnswer = command.equalsIgnoreCase("Y");
+            attachLock.notify();
+            System.out.print(">> ");
+            continue;
           }
-        } else if (command.startsWith("update ")) {
-          //update [port_number] [new_weight]
-          String[] cmdLine = command.split(" ");
-          if (cmdLine.length >= 3) {
-            processUpdate(Short.parseShort(cmdLine[1]), Short.parseShort(cmdLine[2]));
+        }
+
+        if (command.isEmpty()) {
+          System.out.print(">> ");
+          continue;
+        }
+
+        try {
+          if (command.startsWith("detect ")) {
+            String[] cmdLine = command.split(" ");
+            processDetect(cmdLine[1]);
+          } else if (command.startsWith("disconnect ")) {
+            String[] cmdLine = command.split(" ");
+            processDisconnect(Short.parseShort(cmdLine[1]));
+          } else if (command.startsWith("quit")) {
+            processQuit();
+          } else if (command.startsWith("attach ")) {
+            String[] cmdLine = command.split(" ");
+            processAttach(cmdLine[1], Integer.parseInt(cmdLine[2]),
+                    cmdLine[3], Short.parseShort(cmdLine[4]));
+          } else if (command.equals("start")) {
+            processStart();
+          } else if (command.startsWith("connect ")) {
+            String[] cmdLine = command.split(" ");
+            processConnect(cmdLine[1], Integer.parseInt(cmdLine[2]),
+                    cmdLine[3], Short.parseShort(cmdLine[4]));
+          } else if (command.equals("neighbors")) {
+            processNeighbors();
+          } else if (command.startsWith("send ")) {
+            String[] cmdLine = command.split(" ", 3);
+            if (cmdLine.length >= 3) {
+              processSend(cmdLine[1], cmdLine[2]);
+            } else {
+              System.out.println("Usage: send [Destination IP] [Message]");
+            }
+          } else if (command.startsWith("update ")) {
+            String[] cmdLine = command.split(" ");
+            if (cmdLine.length >= 3) {
+              processUpdate(Short.parseShort(cmdLine[1]), Short.parseShort(cmdLine[2]));
+            } else {
+              System.out.println("Usage: update [port_number] [new_weight]");
+            }
           } else {
-            System.out.println("Usage: update [port_number] [new_weight]");
+            System.out.println("Unknown command: " + command);
           }
-        } else {
-          //invalid command
-          break;
+        } catch (ArrayIndexOutOfBoundsException | NumberFormatException e) {
+          System.out.println("Invalid arguments. Check command usage.");
         }
         System.out.print(">> ");
-        command = br.readLine();
       }
-      isReader.close();
-      br.close();
     } catch (Exception e) {
       e.printStackTrace();
     }
