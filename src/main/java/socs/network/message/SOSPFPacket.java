@@ -29,4 +29,6 @@ public class SOSPFPacket implements Serializable {
   //used by Application Message
   public String message; //user inputted message payload
 
+  public int weight;
+
 }

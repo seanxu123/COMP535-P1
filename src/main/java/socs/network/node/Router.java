@@ -114,7 +114,7 @@ public class Router {
       ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
       // Build and send HELLO packet to request attachment
-      SOSPFPacket hello = makeHelloPacket(simulatedIP);
+      SOSPFPacket hello = makeHelloPacket(simulatedIP, weight);
       out.writeObject(hello);
       out.flush();
 
@@ -127,23 +127,23 @@ public class Router {
         remoteRd.processIPAddress = processIP;
         remoteRd.processPortNumber = processPort;
         remoteRd.simulatedIPAddress = simulatedIP;
+
+        final Link link = new Link(rd, remoteRd, weight, socket, out, in);
         synchronized (ports) {
-          ports[freePort] = new Link(rd, remoteRd);
+          ports[freePort] = link;
         }
+        System.out.println("Your attach request has been accepted;");
       } else {
         // Rejected
         System.out.println("Your attach request has been rejected;");
+        socket.close();
       }
-
-      out.close();
-      in.close();
-      socket.close();
     } catch (Exception e) {
       System.err.println("Failed to attach to " + simulatedIP + ": " + e.getMessage());
     }
   }
 
-  private SOSPFPacket makeHelloPacket(String dstIP) {
+  private SOSPFPacket makeHelloPacket(String dstIP, int weight) {
     SOSPFPacket pkt = new SOSPFPacket();
     pkt.srcProcessIP = rd.processIPAddress;
     pkt.srcProcessPort = rd.processPortNumber;
@@ -152,6 +152,7 @@ public class Router {
     pkt.sospfType = 0;
     pkt.routerID = rd.simulatedIPAddress;
     pkt.neighborID = rd.simulatedIPAddress;
+    pkt.weight = weight;
     return pkt;
   }
 
@@ -188,13 +189,9 @@ public class Router {
       ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream());
 
       SOSPFPacket packet = (SOSPFPacket) in.readObject();
-
       if (packet.sospfType == 0) {
-        handleHello(packet, in, out);
+        handleHello(packet, clientSocket, in, out);
       }
-
-      out.close();
-      in.close();
     } catch (Exception e) {
       System.err.println("Error handling incoming connection: " + e.getMessage());
     } finally {
@@ -202,12 +199,13 @@ public class Router {
     }
   }
 
-  private void handleHello(SOSPFPacket packet, ObjectInputStream in, ObjectOutputStream out) throws Exception {
+  private void handleHello(SOSPFPacket packet, Socket clientSocket, ObjectInputStream in, ObjectOutputStream out) throws Exception {
     String senderSimIP = packet.neighborID;
 
     // Check if link already exists
-    boolean alreadyAttached = false;
+    boolean alreadyAttached;
     synchronized (ports) {
+      alreadyAttached = false;
       for (Link link : ports) {
         if (link != null && link.router2.simulatedIPAddress.equals(senderSimIP)) {
           alreadyAttached = true;
@@ -218,7 +216,6 @@ public class Router {
 
     if (alreadyAttached) {
       // Already attached: HELLO belongs to start handshake
-      System.out.println("received HELLO from " + senderSimIP + ";");
       return;
     }
 
@@ -239,6 +236,7 @@ public class Router {
       if (accepted) {
         // Find a free port and store the link atomically
         int freePort = -1;
+        Link newLink = null;
         synchronized (ports) {
           for (int i = 0; i < ports.length; i++) {
             if (ports[i] == null) {
@@ -251,7 +249,8 @@ public class Router {
             remoteRd.processIPAddress = packet.srcProcessIP;
             remoteRd.processPortNumber = packet.srcProcessPort;
             remoteRd.simulatedIPAddress = senderSimIP;
-            ports[freePort] = new Link(rd, remoteRd);
+            newLink = new Link(rd, remoteRd, packet.weight, clientSocket, out, in);
+            ports[freePort] = newLink;
           }
         }
         if (freePort == -1) {
@@ -259,15 +258,17 @@ public class Router {
           System.out.println("All ports are occupied, rejecting.");
           out.writeObject(makeRejectPacket());
           out.flush();
+          clientSocket.close();
         } else {
           // Send HELLO back to confirm acceptance
-          out.writeObject(makeHelloPacket(senderSimIP));
+          out.writeObject(makeHelloPacket(senderSimIP, packet.weight));
           out.flush();
         }
       } else {
         System.out.println("You rejected the attach request;");
         out.writeObject(makeRejectPacket());
         out.flush();
+        clientSocket.close();
       }
     }
   }
