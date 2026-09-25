@@ -264,6 +264,7 @@ public class Router {
           clientSocket.close();
         } else {
           // Send HELLO back to confirm acceptance
+          System.out.println("You accepted the attach request from " + senderSimIP + ";");
           out.writeObject(makeHelloPacket(senderSimIP, packet.weight));
           out.flush();
           final Link link = newLink;
@@ -355,10 +356,16 @@ public class Router {
    */
   private void processNeighbors() {
     synchronized (ports) {
+      boolean hasNeighbors = false;
       for (Link link : ports) {
         if (link != null && link.router2.status == RouterStatus.TWO_WAY) {
           System.out.println(link.router2.simulatedIPAddress);
+          hasNeighbors = true;
         }
+      }
+
+      if (!hasNeighbors) {
+        System.out.println("No neighbors found.");
       }
     }
   }
