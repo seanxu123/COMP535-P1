@@ -440,7 +440,6 @@ public class Router {
 
   public void terminal() {
     try {
-      System.out.print(">> ");
       String command;
       while (true) {
         command = consoleReader.readLine();
@@ -452,13 +451,11 @@ public class Router {
           if (hasPendingAttachRequest) {
             attachRequestAnswer = command.equalsIgnoreCase("Y");
             attachLock.notify();
-            System.out.print(">> ");
             continue;
           }
         }
 
         if (command.isEmpty()) {
-          System.out.print(">> ");
           continue;
         }
 
@@ -503,7 +500,6 @@ public class Router {
         } catch (ArrayIndexOutOfBoundsException | NumberFormatException e) {
           System.out.println("Invalid arguments. Check command usage.");
         }
-        System.out.print(">> ");
       }
     } catch (Exception e) {
       e.printStackTrace();
