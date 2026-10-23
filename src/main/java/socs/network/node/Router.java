@@ -10,6 +10,9 @@ import java.io.ObjectOutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
 
 
 public class Router {
@@ -24,10 +27,25 @@ public class Router {
   private ServerSocket serverSocket;
   private final BufferedReader consoleReader = new BufferedReader(new InputStreamReader(System.in));
 
-  // used for attach request Y/N prompting between threads
-  private boolean hasPendingAttachRequest = false;
-  private Boolean attachRequestAnswer = null;
-  private final Object attachLock = new Object();
+  // Buffer for concurrent attach requests
+  private static class AttachRequest {
+    final SOSPFPacket packet;
+    final Socket socket;
+    final ObjectInputStream in;
+    final ObjectOutputStream out;
+    final CompletableFuture<Boolean> answerFuture = new CompletableFuture<>();
+
+    AttachRequest(SOSPFPacket packet, Socket socket, ObjectInputStream in, ObjectOutputStream out) {
+      this.packet = packet;
+      this.socket = socket;
+      this.in = in;
+      this.out = out;
+    }
+  }
+
+  private final BlockingQueue<AttachRequest> attachQueue = new LinkedBlockingQueue<>();
+  private final Object queueLock = new Object();
+  private AttachRequest activeAttachRequest = null;
 
   public Router(Configuration config) {
     rd.simulatedIPAddress = config.getString("socs.network.router.ip");
@@ -222,63 +240,76 @@ public class Router {
       return;
     }
 
-    // New attach request — prompt user for Y/N
-    System.out.println("received HELLO from " + senderSimIP + ";");
-    System.out.println("Do you accept this request? (Y/N)");
-
-    // Set the pending flag and wait for the terminal thread to read the answer
-    synchronized (attachLock) {
-      hasPendingAttachRequest = true;
-      attachRequestAnswer = null;
-      while (attachRequestAnswer == null) {
-        attachLock.wait();
-      }
-      boolean accepted = attachRequestAnswer;
-      hasPendingAttachRequest = false;
-
-      if (accepted) {
-        // Find a free port and store the link atomically
-        int freePort = -1;
-        Link newLink = null;
-        synchronized (ports) {
-          for (int i = 0; i < ports.length; i++) {
-            if (ports[i] == null) {
-              freePort = i;
-              break;
-            }
-          }
-          if (freePort != -1) {
-            RouterDescription remoteRd = new RouterDescription();
-            remoteRd.processIPAddress = packet.srcProcessIP;
-            remoteRd.processPortNumber = packet.srcProcessPort;
-            remoteRd.simulatedIPAddress = senderSimIP;
-            newLink = new Link(rd, remoteRd, packet.weight, clientSocket, out, in);
-            ports[freePort] = newLink;
-          }
-        }
-        if (freePort == -1) {
-          // All ports occupied even though user said Y
-          System.out.println("All ports are occupied, rejecting.");
-          out.writeObject(makeRejectPacket());
-          out.flush();
-          clientSocket.close();
-        } else {
-          // Send HELLO back to confirm acceptance
-          System.out.println("You accepted the attach request from " + senderSimIP + ";");
-          out.writeObject(makeHelloPacket(senderSimIP, packet.weight));
-          out.flush();
-          final Link link = newLink;
-          Thread listener = new Thread(() -> listenOnLink(link));
-          listener.setDaemon(true);
-          listener.start();
-        }
-      } else {
-        System.out.println("You rejected the attach request;");
+    AttachRequest req = new AttachRequest(packet, clientSocket, in, out);
+    synchronized (queueLock) {
+      if ((activeAttachRequest != null && activeAttachRequest.packet.neighborID.equals(senderSimIP)) ||
+          attachQueue.stream().anyMatch(r -> r.packet.neighborID.equals(senderSimIP))) {
         out.writeObject(makeRejectPacket());
         out.flush();
         clientSocket.close();
+        return;
+      }
+
+      if (activeAttachRequest == null) {
+        activeAttachRequest = req;
+        promptAttachRequest(req);
+      } else {
+        attachQueue.offer(req);
       }
     }
+
+    boolean accepted;
+    try {
+      accepted = req.answerFuture.get();
+    } catch (Exception e) {
+      accepted = false;
+    }
+
+    if (accepted) {
+      // Find a free port and store the link atomically
+      int freePort = -1;
+      Link newLink = null;
+      synchronized (ports) {
+        for (int i = 0; i < ports.length; i++) {
+          if (ports[i] == null) {
+            freePort = i;
+            break;
+          }
+        }
+        if (freePort != -1) {
+          RouterDescription remoteRd = new RouterDescription();
+          remoteRd.processIPAddress = packet.srcProcessIP;
+          remoteRd.processPortNumber = packet.srcProcessPort;
+          remoteRd.simulatedIPAddress = senderSimIP;
+          newLink = new Link(rd, remoteRd, packet.weight, clientSocket, out, in);
+          ports[freePort] = newLink;
+        }
+      }
+      if (freePort == -1) {
+        System.out.println("All ports are occupied, rejecting.");
+        out.writeObject(makeRejectPacket());
+        out.flush();
+        clientSocket.close();
+      } else {
+        System.out.println("You accepted the attach request from " + senderSimIP + ";");
+        out.writeObject(makeHelloPacket(senderSimIP, packet.weight));
+        out.flush();
+        final Link link = newLink;
+        Thread listener = new Thread(() -> listenOnLink(link));
+        listener.setDaemon(true);
+        listener.start();
+      }
+    } else {
+      System.out.println("You rejected the attach request;");
+      out.writeObject(makeRejectPacket());
+      out.flush();
+      clientSocket.close();
+    }
+  }
+
+  private void promptAttachRequest(AttachRequest req) {
+    System.out.println("received HELLO from " + req.packet.neighborID + ";");
+    System.out.println("Do you accept this request? (Y/N)");
   }
 
   private void listenOnLink(Link link){
@@ -446,13 +477,22 @@ public class Router {
         if (command == null) break;
         command = command.trim();
 
-        // Handle interactive attach confirmation if one is pending
-        synchronized (attachLock) {
-          if (hasPendingAttachRequest) {
-            attachRequestAnswer = command.equalsIgnoreCase("Y");
-            attachLock.notify();
-            continue;
+        // Handle pending attach request if one is waiting
+        AttachRequest reqToAnswer = null;
+        synchronized (queueLock) {
+          if (activeAttachRequest != null) {
+            reqToAnswer = activeAttachRequest;
+            activeAttachRequest = attachQueue.poll();
+            if (activeAttachRequest != null) {
+              promptAttachRequest(activeAttachRequest);
+            }
           }
+        }
+
+        if (reqToAnswer != null) {
+          boolean accepted = command.equalsIgnoreCase("Y");
+          reqToAnswer.answerFuture.complete(accepted);
+          continue;
         }
 
         if (command.isEmpty()) {
