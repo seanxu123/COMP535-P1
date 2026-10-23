@@ -1,5 +1,7 @@
 package socs.network.node;
 
+import socs.network.message.LSA;
+import socs.network.message.LinkDescription;
 import socs.network.message.SOSPFPacket;
 import socs.network.util.Configuration;
 
@@ -10,6 +12,7 @@ import java.io.ObjectOutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.Vector;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -46,6 +49,9 @@ public class Router {
   private final BlockingQueue<AttachRequest> attachQueue = new LinkedBlockingQueue<>();
   private final Object queueLock = new Object();
   private AttachRequest activeAttachRequest = null;
+
+  private int currentSeqNumber = 0;
+
 
   public Router(Configuration config) {
     rd.simulatedIPAddress = config.getString("socs.network.router.ip");
@@ -294,7 +300,7 @@ public class Router {
         System.out.println("You accepted the attach request from " + senderSimIP + ";");
         out.writeObject(makeHelloPacket(senderSimIP, packet.weight));
         out.flush();
-        final Link link = newLink;
+          final Link link = newLink;
         Thread listener = new Thread(() -> listenOnLink(link));
         listener.setDaemon(true);
         listener.start();
@@ -317,11 +323,15 @@ public class Router {
         while (true) {
           SOSPFPacket packet = (SOSPFPacket) link.ois.readObject();
           if (packet.sospfType == 0){
-            handleHelloOnLink(link, packet);
+                handleHelloOnLink(link, packet);
+          } else if (packet.sospfType == 1){
+            handleLSAUpdate(link, packet);
+          } else if (packet.sospfType == 2){
+            handleApplicationMessage(packet);
           }
         }
       } catch (Exception e){
-        System.out.println("Exception occurred when trying to listen on link: " + e);
+        // Socket closed or link disconnected
       }
   }
 
@@ -334,6 +344,8 @@ public class Router {
         neighbor.status = RouterStatus.TWO_WAY;
         System.out.println("set " + packet.srcIP + " STATE to TWO_WAY;");
         sendHello(link);
+        updateLocalLSA();
+        broadcastLSAUpdate(lsd.getAllLSAs(), null);
       } else {
         neighbor.status = RouterStatus.INIT;
         System.out.println("set " + packet.srcIP + " STATE to INIT;");
@@ -342,12 +354,15 @@ public class Router {
     } else if (neighbor.status == RouterStatus.INIT) {
       neighbor.status = RouterStatus.TWO_WAY;
       System.out.println("set " + packet.srcIP + " STATE to TWO_WAY;");
+      updateLocalLSA();
+      broadcastLSAUpdate(lsd.getAllLSAs(), null);
     }
   }
 
   private void sendHello(Link link){
     try {
       synchronized (link) {
+        link.oos.reset();
         link.oos.writeObject(makeHelloPacket(link.router2.simulatedIPAddress, link.weight));
         link.oos.flush();
       }
@@ -357,16 +372,98 @@ public class Router {
   }
 
   /**
-   * broadcast Hello to neighbors
+   * broadcast Hello to neighbors and synchronize link state database
    */
   private void processStart() {
+    boolean hasTwoWay = false;
     synchronized (ports) {
       for (Link link : ports) {
         if (link != null){
           link.startedByUs = true;
           sendHello(link);
+          if (link.router2.status == RouterStatus.TWO_WAY) {
+            hasTwoWay = true;
+          }
         }
       }
+    }
+    if (hasTwoWay) {
+      updateLocalLSA();
+      broadcastLSAUpdate(lsd.getAllLSAs(), null);
+    }
+  }
+
+  // Rebuild local LSA with current TWO_WAY neighbors and update LSDB
+  private synchronized void updateLocalLSA() {
+    currentSeqNumber++;
+    LSA lsa = new LSA();
+    lsa.linkStateID = rd.simulatedIPAddress;
+    lsa.lsaSeqNumber = currentSeqNumber;
+
+    synchronized (ports) {
+      for (int i = 0; i < ports.length; i++) {
+        Link link = ports[i];
+        if (link != null && link.router2.status == RouterStatus.TWO_WAY) {
+          LinkDescription ld = new LinkDescription();
+          ld.linkID = link.router2.simulatedIPAddress;
+          ld.portNum = i;
+          ld.tosMetrics = 0;
+          ld.weight = link.weight;
+          lsa.links.add(ld);
+        }
+      }
+    }
+    lsd.putLSA(lsa);
+  }
+
+  private void sendLSAUpdate(Link link, Vector<LSA> lsaList) {
+    try {
+      SOSPFPacket pkt = new SOSPFPacket();
+      pkt.srcProcessIP = rd.processIPAddress;
+      pkt.srcProcessPort = rd.processPortNumber;
+      pkt.srcIP = rd.simulatedIPAddress;
+      pkt.dstIP = link.router2.simulatedIPAddress;
+      pkt.sospfType = 1;
+      pkt.routerID = rd.simulatedIPAddress;
+      pkt.lsaArray = lsaList;
+
+      synchronized (link) {
+        link.oos.reset();
+        link.oos.writeObject(pkt);
+        link.oos.flush();
+      }
+    } catch (Exception e) {
+      System.err.println("Failed to send LSAUPDATE to " + link.router2.simulatedIPAddress + ": " + e.getMessage());
+    }
+  }
+
+  // Flood LSAs to all TWO_WAY neighbors except excludeLink
+  private void broadcastLSAUpdate(Vector<LSA> lsaList, Link excludeLink) {
+    if (lsaList == null || lsaList.isEmpty()) {
+      return;
+    }
+    synchronized (ports) {
+      for (Link link : ports) {
+        if (link != null && link.router2.status == RouterStatus.TWO_WAY && link != excludeLink) {
+          sendLSAUpdate(link, lsaList);
+        }
+      }
+    }
+  }
+
+  // Process received LSA update and forward newer LSAs
+  private void handleLSAUpdate(Link incomingLink, SOSPFPacket packet) {
+    if (packet.lsaArray == null || packet.lsaArray.isEmpty()) {
+      return;
+    }
+    Vector<LSA> newerLSAs = new Vector<>();
+    for (LSA lsa : packet.lsaArray) {
+      if (lsd.updateLSA(lsa)) {
+        newerLSAs.add(lsa);
+      }
+    }
+    if (!newerLSAs.isEmpty()) {
+      broadcastLSAUpdate(newerLSAs, incomingLink);
     }
   }
 
@@ -520,6 +617,9 @@ public class Router {
                     cmdLine[3], Short.parseShort(cmdLine[4]));
           } else if (command.equals("neighbors")) {
             processNeighbors();
+
+          } else if (command.equals("dump")) {
+            System.out.print(lsd.toString());
           } else if (command.startsWith("send ")) {
             String[] cmdLine = command.split(" ", 3);
             if (cmdLine.length >= 3) {

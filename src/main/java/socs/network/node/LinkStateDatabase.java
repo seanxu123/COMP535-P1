@@ -29,9 +29,43 @@ public class LinkStateDatabase {
    * @param destinationIP the simulated IP address of the destination router
    * @return the shortest path as a string, or null if no path exists
    */
-  String getShortestPath(String destinationIP) {
+  synchronized String getShortestPath(String destinationIP) {
     //TODO: fill the implementation here
     return null;
+  }
+
+  // Update LSA if newer than existing entry; ignore echoes of our own LSA
+  public synchronized boolean updateLSA(LSA incomingLSA) {
+    if (incomingLSA == null || incomingLSA.linkStateID == null) {
+      return false;
+    }
+    if (incomingLSA.linkStateID.equals(rd.simulatedIPAddress)) {
+      return false;
+    }
+    LSA current = _store.get(incomingLSA.linkStateID);
+    if (current == null || incomingLSA.lsaSeqNumber > current.lsaSeqNumber) {
+      _store.put(incomingLSA.linkStateID, incomingLSA);
+      return true;
+    }
+    return false;
+  }
+
+  public synchronized void putLSA(LSA lsa) {
+    if (lsa != null && lsa.linkStateID != null) {
+      _store.put(lsa.linkStateID, lsa);
+    }
+  }
+
+  public synchronized LSA getLSA(String routerIP) {
+    return _store.get(routerIP);
+  }
+
+  public synchronized java.util.Vector<LSA> getAllLSAs() {
+    return new java.util.Vector<LSA>(_store.values());
+  }
+
+  public synchronized HashMap<String, LSA> getStore() {
+    return _store;
   }
 
   //initialize the linkstate database by adding an entry about the router itself
@@ -49,7 +83,7 @@ public class LinkStateDatabase {
   }
 
 
-  public String toString() {
+  public synchronized String toString() {
     StringBuilder sb = new StringBuilder();
     for (LSA lsa: _store.values()) {
       sb.append(lsa.linkStateID).append("(" + lsa.lsaSeqNumber + ")").append(":\t");
