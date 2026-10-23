@@ -16,6 +16,7 @@ import java.util.Vector;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 
 public class Router {
@@ -52,6 +53,13 @@ public class Router {
 
   private int currentSeqNumber = 0;
 
+  // Message counters
+  public final AtomicInteger helloSent = new AtomicInteger(0);
+  public final AtomicInteger helloReceived = new AtomicInteger(0);
+  public final AtomicInteger lsaUpdateSent = new AtomicInteger(0);
+  public final AtomicInteger lsaUpdateReceived = new AtomicInteger(0);
+  public final AtomicInteger appMessageSent = new AtomicInteger(0);
+  public final AtomicInteger appMessageReceived = new AtomicInteger(0);
 
   public Router(Configuration config) {
     rd.simulatedIPAddress = config.getString("socs.network.router.ip");
@@ -141,11 +149,13 @@ public class Router {
       SOSPFPacket hello = makeHelloPacket(simulatedIP, weight);
       out.writeObject(hello);
       out.flush();
+      helloSent.incrementAndGet();
 
       // Wait for accept/reject response
       SOSPFPacket response = (SOSPFPacket) in.readObject();
 
       if (response.sospfType == 0) {
+        helloReceived.incrementAndGet();
         // Accepted — create the link and store it
         RouterDescription remoteRd = new RouterDescription();
         remoteRd.processIPAddress = processIP;
@@ -218,6 +228,7 @@ public class Router {
 
       SOSPFPacket packet = (SOSPFPacket) in.readObject();
       if (packet.sospfType == 0) {
+        helloReceived.incrementAndGet();
         handleHello(packet, clientSocket, in, out);
       }
     } catch (Exception e) {
@@ -300,7 +311,8 @@ public class Router {
         System.out.println("You accepted the attach request from " + senderSimIP + ";");
         out.writeObject(makeHelloPacket(senderSimIP, packet.weight));
         out.flush();
-          final Link link = newLink;
+        helloSent.incrementAndGet();
+        final Link link = newLink;
         Thread listener = new Thread(() -> listenOnLink(link));
         listener.setDaemon(true);
         listener.start();
@@ -323,10 +335,13 @@ public class Router {
         while (true) {
           SOSPFPacket packet = (SOSPFPacket) link.ois.readObject();
           if (packet.sospfType == 0){
-                handleHelloOnLink(link, packet);
+            helloReceived.incrementAndGet();
+            handleHelloOnLink(link, packet);
           } else if (packet.sospfType == 1){
+            lsaUpdateReceived.incrementAndGet();
             handleLSAUpdate(link, packet);
           } else if (packet.sospfType == 2){
+            appMessageReceived.incrementAndGet();
             handleApplicationMessage(packet);
           }
         }
@@ -366,6 +381,7 @@ public class Router {
         link.oos.writeObject(makeHelloPacket(link.router2.simulatedIPAddress, link.weight));
         link.oos.flush();
       }
+      helloSent.incrementAndGet();
     } catch (Exception e){
       System.err.println("Failed to send HELLO to " + link.router2.simulatedIPAddress);
     }
@@ -432,6 +448,7 @@ public class Router {
         link.oos.writeObject(pkt);
         link.oos.flush();
       }
+      lsaUpdateSent.incrementAndGet();
     } catch (Exception e) {
       System.err.println("Failed to send LSAUPDATE to " + link.router2.simulatedIPAddress + ": " + e.getMessage());
     }
@@ -496,6 +513,15 @@ public class Router {
         System.out.println("No neighbors found.");
       }
     }
+  }
+
+  private void processStats() {
+    System.out.println("HELLO sent: " + helloSent.get());
+    System.out.println("HELLO received: " + helloReceived.get());
+    System.out.println("LSAUPDATE sent: " + lsaUpdateSent.get());
+    System.out.println("LSAUPDATE received: " + lsaUpdateReceived.get());
+    System.out.println("APP_MESSAGE sent: " + appMessageSent.get());
+    System.out.println("APP_MESSAGE received: " + appMessageReceived.get());
   }
 
   /**
@@ -617,7 +643,8 @@ public class Router {
                     cmdLine[3], Short.parseShort(cmdLine[4]));
           } else if (command.equals("neighbors")) {
             processNeighbors();
-
+          } else if (command.equals("stats")) {
+            processStats();
           } else if (command.equals("dump")) {
             System.out.print(lsd.toString());
           } else if (command.startsWith("send ")) {
