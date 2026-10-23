@@ -45,13 +45,19 @@ Run one instance per router, each in its own terminal, pointed at that router's 
 `.conf` file. On startup, each router prints its Process IP, Process Port, and Simulated IP.
 You'll need the Process IP/Port to `attach` to it from another terminal.
 
-## PA1 Commands
+## Commands
 
 ```
 attach [Process IP] [Process Port] [Simulated IP] [Link Weight]
 start
 neighbors
+detect [Destination IP]
+send [Destination IP] [Message]
+stats
+dump
 ```
+
+### PA1
 
 * `attach` opens a socket to the target router and requests a link; the receiving router is
   prompted `(Y/N)` to accept or reject. Does **not** trigger HELLO/state sync by itself.
@@ -63,6 +69,27 @@ neighbors
 
 Each router supports up to 4 links and further `attach` attempts are rejected once
 full, on both the initiating and accepting side.
+
+### PA2
+
+* `start` now also synchronizes the link state database. Whenever a link reaches `TWO_WAY`,
+  the router rebuilds its own LSA (with an incremented sequence number) and floods its LSDB
+  to its `TWO_WAY` neighbors in `LSAUPDATE` messages. A router that receives an LSAUPDATE only
+  stores LSAs with a higher sequence number than the one it holds, and forwards only those
+  newer LSAs to all neighbors except the one it received them from.
+* `detect [Destination IP]` runs Dijkstra (using link weights, not hop count) over the LSDB and
+  prints `Path found: <src> -> (cost) <hop> -> ... -> <dst>`, or `Path not found`.
+* `send [Destination IP] [Message]` sends an application message hop by hop along the shortest
+  path. Intermediate routers print the source, destination, and next hop but never the payload;
+  only the destination prints the message.
+* `stats` prints the number of HELLO, LSAUPDATE, and APP_MESSAGE messages sent and received since
+  the router started. A message sent to several neighbors counts once per neighbor, and a
+  forwarded application message counts as both received and sent. The HELLOs exchanged during
+  `attach` are included in the HELLO counters.
+* `dump` (debugging aid, not part of the spec) prints this router's current LSDB.
+
+**Usage note:** flooding is asynchronous, so after running `start` on every router, give the
+network a moment to converge (check with `dump`) before running `detect` or `send`.
 
 ## Troubleshooting
 
@@ -107,11 +134,15 @@ conf/              # Router configuration files
 target/            # Compiled classes (generated)
 ```
 
-## Implementation Notes 
+## Implementation Notes
 
-* Only `attach`, `start`  and `neighbors` are implemented
-  for this assignment; `detect`, `send`, `connect`, `disconnect`, `update`, and `quit` are
-  intentionally empty stubs.
+* `connect`, `disconnect`, `update`, and `quit` are intentionally empty stubs (PA3).
 * Each `Link` keeps its socket connection open after a successful `attach` rather than closing
-  it, and a background thread listens on it. This is what lets `start`'s HELLO exchange
-  happen later over the same connection.
+  it, and a background thread listens on it. HELLO, LSAUPDATE, and application messages all
+  travel over that same connection.
+* Each router's LSA lists one entry per `TWO_WAY` neighbor. Dijkstra skips the weight-0
+  self-link every router's LSDB starts with.
+* Link streams are reset (`ObjectOutputStream.reset()`) before every write, so updated LSAs are
+  never replaced by stale cached copies.
+* Restart the whole topology between test runs: LSA sequence numbers restart at 1 when a router
+  process restarts, so neighbors would ignore a restarted router's new LSAs.
