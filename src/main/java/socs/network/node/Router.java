@@ -96,7 +96,12 @@ public class Router {
    * @param destinationIP the ip adderss of the destination simulated router
    */
   private void processDetect(String destinationIP) {
-
+    String path = lsd.getShortestPath(destinationIP);
+    if (path == null) {
+      System.out.println("Path not found");
+    } else {
+      System.out.println("Path found: " + path);
+    }
   }
 
   /**
@@ -331,23 +336,28 @@ public class Router {
   }
 
   private void listenOnLink(Link link){
-      try{
-        while (true) {
-          SOSPFPacket packet = (SOSPFPacket) link.ois.readObject();
-          if (packet.sospfType == 0){
+    try {
+      while (true) {
+        SOSPFPacket packet = (SOSPFPacket) link.ois.readObject();
+        try {
+          if (packet.sospfType == 0) {
             helloReceived.incrementAndGet();
             handleHelloOnLink(link, packet);
-          } else if (packet.sospfType == 1){
+          } else if (packet.sospfType == 1) {
             lsaUpdateReceived.incrementAndGet();
             handleLSAUpdate(link, packet);
-          } else if (packet.sospfType == 2){
+          } else if (packet.sospfType == 2) {
             appMessageReceived.incrementAndGet();
             handleApplicationMessage(packet);
           }
+        } catch (Exception e) {
+          // a bad packet or handler bug must not kill this link's listener
+          System.err.println("Error handling packet: " + e);
         }
-      } catch (Exception e){
-        // Socket closed or link disconnected
       }
+    } catch (Exception e) {
+      // socket closed or link disconnected
+    }
   }
 
   private synchronized void handleHelloOnLink(Link link, SOSPFPacket packet){
@@ -570,7 +580,53 @@ public class Router {
    * @param message the message content to send
    */
   private void processSend(String destinationIP, String message) {
+    if (destinationIP.equals(rd.simulatedIPAddress)) {
+      System.out.println("Cannot send a message to this router itself.");
+      return;
+    }
+    String nextHop = lsd.getNextHop(destinationIP);
+    if (nextHop == null) {
+      System.out.println("Path not found");
+      return;
+    }
 
+    System.out.println("Sending message to " + destinationIP);
+    SOSPFPacket pkt = new SOSPFPacket();
+    pkt.srcProcessIP = rd.processIPAddress;
+    pkt.srcProcessPort = rd.processPortNumber;
+    pkt.srcIP = rd.simulatedIPAddress;
+    pkt.dstIP = destinationIP;
+    pkt.sospfType = 2;
+    pkt.routerID = rd.simulatedIPAddress;
+    pkt.message = message;
+    forwardAppMessage(pkt, nextHop);
+  }
+
+  private void forwardAppMessage(SOSPFPacket pkt, String nextHop) {
+    Link out = null;
+    synchronized (ports) {
+      for (Link link : ports) {
+        if (link != null && link.router2.status == RouterStatus.TWO_WAY
+                && link.router2.simulatedIPAddress.equals(nextHop)) {
+          out = link;
+          break;
+        }
+      }
+    }
+    if (out == null) {
+      System.out.println("No active link to next hop " + nextHop + "; message dropped.");
+      return;
+    }
+    try {
+      synchronized (out) {
+        out.oos.reset();
+        out.oos.writeObject(pkt);
+        out.oos.flush();
+      }
+      appMessageSent.incrementAndGet();
+    } catch (Exception e) {
+      System.err.println("Failed to forward message to " + nextHop + ": " + e.getMessage());
+    }
   }
 
   /**
@@ -589,7 +645,20 @@ public class Router {
    * @param packet the received application message packet
    */
   private void handleApplicationMessage(SOSPFPacket packet) {
+    if (packet.dstIP.equals(rd.simulatedIPAddress)) {
+      System.out.println("Received message from " + packet.srcIP + ";");
+      System.out.println("Message: " + packet.message);
+      return;
+    }
 
+    String nextHop = lsd.getNextHop(packet.dstIP);
+    if (nextHop == null) {
+      System.out.println("No route to " + packet.dstIP + "; message dropped.");
+      return;
+    }
+    System.out.println("Forwarding message from " + packet.srcIP + " to " + packet.dstIP);
+    System.out.println("Next hop: " + nextHop);
+    forwardAppMessage(packet, nextHop);
   }
 
   public void terminal() {
