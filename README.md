@@ -146,3 +146,10 @@ target/            # Compiled classes (generated)
   never replaced by stale cached copies.
 * Restart the whole topology between test runs: LSA sequence numbers restart at 1 when a router
   process restarts, so neighbors would ignore a restarted router's new LSAs.
+
+## Collaboration Statement
+
+This project was completed collaboratively by **Hamza Chaudhry** and **Sean Xu**:
+* **Hamza Chaudhry**: Requirement 1 (LSDB Synchronization) and Requirement 4 (`stats`).
+* **Sean Xu**: Requirement 2 (Shortest Path / `detect`) and Requirement 3 (Message Forwarding / `send`).
+
